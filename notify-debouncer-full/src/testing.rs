@@ -273,6 +273,9 @@ impl schema::State {
             rescan_event,
             errors: Vec::new(),
             timeout: Duration::from_millis(self.timeout.unwrap_or(50)),
+            recovery: None,
+            scan_pending: false,
+            pending_resync: Vec::new(),
         }
     }
 }

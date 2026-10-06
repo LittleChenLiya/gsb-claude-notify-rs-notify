@@ -7,6 +7,9 @@
 //! * Emits only one `Remove` event when deleting a directory (inotify)
 //! * Doesn't emit duplicate create events
 //! * Doesn't emit `Modify` events after a `Create` event
+//! * Optionally recovers from lost events (overflow) by diffing a fresh directory
+//!   snapshot against the last confirmed one and emitting a resync batch, see
+//!   [`new_debouncer_opt_with_recovery`]
 //!
 //! # Installation
 //!
@@ -64,6 +67,7 @@
 //! As all file events are sourced from notify, the [known problems](https://docs.rs/notify/latest/notify/#known-problems) section applies here too.
 
 mod cache;
+mod resync;
 mod time;
 
 #[cfg(test)]
@@ -87,6 +91,11 @@ use rustc_hash::FxHashMap as HashMap;
 use time::now;
 
 pub use cache::{FileIdCache, NoCache, RecommendedCache};
+pub use resync::{
+    DirScanner, Fingerprint, RecoveryConfig, Snapshot, SnapshotEntry, WalkDirScanner,
+};
+
+use resync::{PendingScan, RecoveryState};
 
 #[cfg(not(target_family = "wasm"))]
 pub use file_id_map::FileIdMap;
@@ -222,6 +231,14 @@ pub(crate) struct DebounceDataInner<T> {
     rescan_event: Option<DebouncedEvent>,
     errors: Vec<Error>,
     timeout: Duration,
+    /// Optional overflow recovery coordinator state.
+    recovery: Option<RecoveryState>,
+    /// A recovery scan has been requested and waits to be picked up by the
+    /// debouncer thread.
+    scan_pending: bool,
+    /// Resync batch produced by a finished recovery scan, published with the
+    /// next debounced events.
+    pending_resync: Vec<DebouncedEvent>,
 }
 
 impl<T: FileIdCache> DebounceDataInner<T> {
@@ -234,13 +251,28 @@ impl<T: FileIdCache> DebounceDataInner<T> {
             rescan_event: None,
             errors: Vec::new(),
             timeout,
+            recovery: None,
+            scan_pending: false,
+            pending_resync: Vec::new(),
         }
     }
 
     /// Retrieve a vec of debounced events, removing them if not continuous
     pub fn debounced_events(&mut self) -> Vec<DebouncedEvent> {
+        // Normal batch publishing is paused while a recovery scan is pending
+        // or in flight.
+        if self.scan_pending
+            || self
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.scanning)
+        {
+            return Vec::new();
+        }
+
         let now = now();
-        let mut events_expired = Vec::with_capacity(self.queues.len());
+        // A finished resync batch is published immediately.
+        let mut events_expired = std::mem::take(&mut self.pending_resync);
 
         if let Some(event) = self.rescan_event.take() {
             if now.saturating_duration_since(event.time) >= self.timeout {
@@ -298,10 +330,43 @@ impl<T: FileIdCache> DebounceDataInner<T> {
     pub fn add_event(&mut self, event: Event) {
         log::trace!("raw event: {event:?}");
 
+        // Overflow recovery in progress: buffer events by generation instead
+        // of publishing them, so the in-flight scan cannot race newer state.
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.scanning)
+        {
+            if event.need_rescan() {
+                // Consecutive overflow: the in-flight scan may be based on a
+                // state that already lost events, scan again once it finishes.
+                self.recovery.as_mut().unwrap().rescan_requested = true;
+            } else {
+                let recovery = self.recovery.as_mut().unwrap();
+                if recovery.buffered.len() >= recovery.max_buffered_events {
+                    log::warn!("overflow recovery buffer limit exceeded");
+                    self.errors.push(Error::new(ErrorKind::Generic(
+                        "overflow recovery buffer limit exceeded".to_string(),
+                    )));
+                    self.recovery.as_mut().unwrap().rescan_requested = true;
+                } else {
+                    recovery.buffered.push(event);
+                }
+            }
+            return;
+        }
+
         if event.need_rescan() {
             let roots = self.roots.make_contiguous();
             self.cache.rescan(roots);
-            self.rescan_event = Some(DebouncedEvent { event, time: now() });
+
+            if self.recovery.is_some() {
+                // Pause normal batch publishing and recover by diffing a fresh
+                // directory snapshot against the last confirmed one.
+                self.start_recovery();
+            } else {
+                self.rescan_event = Some(DebouncedEvent { event, time: now() });
+            }
             return;
         }
 
@@ -375,6 +440,157 @@ impl<T: FileIdCache> DebounceDataInner<T> {
         }
 
         RecursiveMode::NonRecursive
+    }
+
+    /// Start a new recovery generation: pause normal publishing and request a
+    /// fresh snapshot scan from the debouncer thread.
+    fn start_recovery(&mut self) {
+        if let Some(recovery) = &mut self.recovery {
+            recovery.generation += 1;
+            recovery.scanning = true;
+            recovery.rescan_requested = false;
+            recovery.buffered.clear();
+            self.scan_pending = true;
+        }
+    }
+
+    /// Take the pending scan request, if any, so the debouncer thread can run
+    /// the scanner outside the lock.
+    pub(crate) fn take_pending_scan(&mut self) -> Option<PendingScan> {
+        if !self.scan_pending {
+            return None;
+        }
+        self.scan_pending = false;
+
+        let recovery = self.recovery.as_ref()?;
+        let roots = self.roots.iter().cloned().collect();
+        Some((recovery.generation, roots, recovery.scanner.clone()))
+    }
+
+    /// Complete the recovery scan for `generation`.
+    ///
+    /// A late result from an older generation is discarded and never
+    /// overwrites newer state. Otherwise the fresh snapshot is diffed against
+    /// the last confirmed one, the resulting resync batch is queued for
+    /// publishing, and the events buffered during the scan are replayed and
+    /// re-checked against disk.
+    pub(crate) fn complete_scan(&mut self, generation: u64, result: Result<Snapshot, Error>) {
+        {
+            let Some(recovery) = &self.recovery else {
+                return;
+            };
+            if !recovery.scanning || recovery.generation != generation {
+                log::debug!("discarding stale recovery scan for generation {generation}");
+                return;
+            }
+        }
+        self.recovery.as_mut().unwrap().scanning = false;
+
+        match result {
+            Ok(snapshot) => {
+                let previous = self
+                    .recovery
+                    .as_mut()
+                    .unwrap()
+                    .last_confirmed
+                    .take()
+                    .unwrap_or_default();
+
+                let time = now();
+                self.pending_resync.extend(
+                    snapshot
+                        .diff(&previous)
+                        .into_iter()
+                        .map(|event| DebouncedEvent::new(event, time)),
+                );
+
+                self.recovery.as_mut().unwrap().last_confirmed = Some(snapshot);
+            }
+            Err(error) => {
+                log::warn!("overflow recovery scan failed: {error:?}");
+                self.errors.push(error);
+            }
+        }
+
+        // Replay the events buffered (by generation) during the scan and
+        // re-check them against disk, so the confirmed snapshot reflects the
+        // newest state and the just-finished scan cannot clobber it.
+        self.replay_buffered_events();
+
+        // A consecutive overflow was signalled while scanning: scan again.
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.rescan_requested)
+        {
+            self.start_recovery();
+        }
+    }
+
+    fn replay_buffered_events(&mut self) {
+        let Some(recovery) = &mut self.recovery else {
+            return;
+        };
+        let buffered = std::mem::take(&mut recovery.buffered);
+
+        for event in buffered {
+            self.recheck_confirmed_snapshot(&event);
+            self.add_event(event);
+        }
+    }
+
+    /// Re-check a replayed event against disk and reconcile the confirmed
+    /// snapshot, so it always reflects the newest known state.
+    fn recheck_confirmed_snapshot(&mut self, event: &Event) {
+        let Some(path) = event.paths.first() else {
+            return;
+        };
+        let Some(recovery) = &self.recovery else {
+            return;
+        };
+        let scanner = recovery.scanner.clone();
+        let Some(confirmed) = self
+            .recovery
+            .as_mut()
+            .and_then(|recovery| recovery.last_confirmed.as_mut())
+        else {
+            return;
+        };
+
+        match &event.kind {
+            EventKind::Create(_) | EventKind::Modify(_) => {
+                if let Some(entry) = scanner.fingerprint(path) {
+                    confirmed.insert(path.clone(), entry);
+                } else {
+                    confirmed.remove(path);
+                }
+            }
+            EventKind::Remove(_) => {
+                confirmed.remove(path);
+            }
+            _ => {}
+        }
+    }
+
+    /// Take the initial baseline snapshot once the first root is watched.
+    fn refresh_baseline_snapshot(&mut self) {
+        let Some(recovery) = &self.recovery else {
+            return;
+        };
+        if recovery.last_confirmed.is_some() || recovery.scanning {
+            return;
+        }
+
+        let scanner = recovery.scanner.clone();
+        let roots: Vec<_> = self.roots.iter().cloned().collect();
+        match scanner.scan(&roots) {
+            Ok(snapshot) => {
+                self.recovery.as_mut().unwrap().last_confirmed = Some(snapshot);
+            }
+            Err(error) => {
+                self.errors.push(error);
+            }
+        }
     }
 
     fn handle_rename_from(&mut self, event: Event) {
@@ -612,6 +828,8 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         }
 
         data.cache.add_path(&path, recursive_mode);
+
+        data.refresh_baseline_snapshot();
     }
 
     fn remove_root(&mut self, path: impl AsRef<Path>) {
@@ -620,6 +838,14 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         data.roots.retain(|(root, _)| !root.starts_with(&path));
 
         data.cache.remove_path(path.as_ref());
+
+        if let Some(confirmed) = data
+            .recovery
+            .as_mut()
+            .and_then(|recovery| recovery.last_confirmed.as_mut())
+        {
+            confirmed.remove(path.as_ref());
+        }
     }
 
     pub fn watch(
@@ -739,12 +965,69 @@ impl<T: Watcher, C: FileIdCache> Drop for Debouncer<T, C> {
 pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + Send + 'static>(
     timeout: Duration,
     tick_rate: Option<Duration>,
-    mut event_handler: F,
+    event_handler: F,
     file_id_cache: C,
     config: notify::Config,
 ) -> Result<Debouncer<T, C>, Error> {
+    new_debouncer_impl(
+        timeout,
+        tick_rate,
+        event_handler,
+        file_id_cache,
+        config,
+        None,
+    )
+}
+
+/// Creates a new debounced watcher with custom configuration and an overflow
+/// recovery coordinator.
+///
+/// When the watcher reports lost events, the coordinator pauses normal batch
+/// emission, scans the watched roots through the injected [`DirScanner`],
+/// diffs the fresh snapshot against the last confirmed one and emits a resync
+/// batch with per-path creations, removals and content fingerprint changes.
+/// Events arriving while a scan is in flight are buffered per generation and
+/// replayed (and re-checked) once the scan completes.
+///
+/// Timeout is the amount of time after which a debounced event is emitted.
+///
+/// If `tick_rate` is `None`, notify will select a tick rate that is 1/4 of the provided timeout.
+pub fn new_debouncer_opt_with_recovery<
+    F: DebounceEventHandler,
+    T: Watcher,
+    C: FileIdCache + Send + 'static,
+    S: DirScanner,
+>(
+    timeout: Duration,
+    tick_rate: Option<Duration>,
+    event_handler: F,
+    file_id_cache: C,
+    config: notify::Config,
+    recovery: RecoveryConfig<S>,
+) -> Result<Debouncer<T, C>, Error> {
+    new_debouncer_impl(
+        timeout,
+        tick_rate,
+        event_handler,
+        file_id_cache,
+        config,
+        Some(RecoveryState::new(recovery)),
+    )
+}
+
+fn new_debouncer_impl<F: DebounceEventHandler, T: Watcher, C: FileIdCache + Send + 'static>(
+    timeout: Duration,
+    tick_rate: Option<Duration>,
+    mut event_handler: F,
+    file_id_cache: C,
+    config: notify::Config,
+    recovery: Option<RecoveryState>,
+) -> Result<Debouncer<T, C>, Error> {
+    let mut inner = DebounceDataInner::new(file_id_cache, timeout);
+    inner.recovery = recovery;
+
     let data = Arc::new(SharedDebounceData {
-        inner: Mutex::new(DebounceDataInner::new(file_id_cache, timeout)),
+        inner: Mutex::new(inner),
         changed: Condvar::new(),
     });
     let stop = Arc::new(AtomicBool::new(false));
@@ -776,12 +1059,24 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
                 while lock.queues.is_empty()
                     && lock.errors.is_empty()
                     && lock.rescan_event.is_none()
+                    && !lock.scan_pending
+                    && lock.pending_resync.is_empty()
                     && !stop_c.load(Ordering::Acquire)
                 {
                     lock = data_c.changed.wait(lock).unwrap();
                 }
                 if stop_c.load(Ordering::Acquire) {
                     break;
+                }
+                // Run a pending recovery scan outside the lock, so the watcher
+                // callback can keep buffering events while scanning.
+                if let Some((generation, roots, scanner)) = lock.take_pending_scan() {
+                    drop(lock);
+                    let result = scanner.scan(&roots);
+                    let mut lock = data_c.inner.lock().unwrap();
+                    lock.complete_scan(generation, result);
+                    drop(lock);
+                    continue;
                 }
                 drop(lock);
                 std::thread::sleep(tick);
@@ -1137,6 +1432,9 @@ mod tests {
             rescan_event: None,
             errors: Vec::new(),
             timeout: Duration::from_millis(50),
+            recovery: None,
+            scan_pending: false,
+            pending_resync: Vec::new(),
         };
 
         assert_eq!(
@@ -1210,6 +1508,157 @@ mod tests {
         }
 
         panic!("did not receive expected event");
+    }
+
+    /// End-to-end test of the overflow recovery coordinator on the real
+    /// debouncer thread, with a scripted scanner:
+    ///
+    /// 1. a delete and a create are lost → the resync batch must recover both
+    /// 2. a file created mid-scan must end up in the final confirmed snapshot
+    #[test]
+    fn integration_overflow_recovery() -> Result<(), Box<dyn std::error::Error>> {
+        use notify::event::{CreateKind, Flag};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        /// Scanner that snapshots the real file system, but holds its second
+        /// scan open so the test can create a file mid-scan.
+        #[derive(Debug)]
+        struct HookScanner {
+            scan_count: AtomicUsize,
+            started_tx: std::sync::mpsc::Sender<usize>,
+            continue_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl DirScanner for HookScanner {
+            fn scan(&self, roots: &[(PathBuf, RecursiveMode)]) -> Result<Snapshot, Error> {
+                // snapshot first, so a file created while we block below is
+                // deliberately missing from this scan's result
+                let snapshot = WalkDirScanner::new().scan(roots)?;
+                let n = self.scan_count.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.started_tx.send(n).unwrap();
+                if n == 2 {
+                    self.continue_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok(snapshot)
+            }
+
+            fn fingerprint(&self, path: &Path) -> Option<SnapshotEntry> {
+                resync::fingerprint_path(path)
+            }
+        }
+
+        let dir = tempdir()?;
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("a.txt"), b"a")?;
+        fs::write(root.join("b.txt"), b"b")?;
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let scanner = HookScanner {
+            scan_count: AtomicUsize::new(0),
+            started_tx,
+            continue_rx: Mutex::new(continue_rx),
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut debouncer = new_debouncer_opt_with_recovery::<_, notify::NullWatcher, NoCache, _>(
+            Duration::from_millis(50),
+            Some(Duration::from_millis(10)),
+            tx,
+            NoCache::new(),
+            notify::Config::default(),
+            RecoveryConfig::new(scanner).with_max_buffered_events(16),
+        )?;
+        debouncer.watch(&root, RecursiveMode::Recursive)?;
+
+        // the baseline snapshot is taken synchronously during `watch`
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5))?, 1);
+        {
+            let data = debouncer.data.inner.lock().unwrap();
+            let confirmed = data
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.last_confirmed.as_ref())
+                .expect("baseline snapshot");
+            assert!(confirmed.contains_path(&root.join("a.txt")));
+            assert!(confirmed.contains_path(&root.join("b.txt")));
+        }
+
+        // silently lose a delete and a create (NullWatcher reports nothing)
+        fs::remove_file(root.join("a.txt"))?;
+        fs::write(root.join("c.txt"), b"c")?;
+
+        // signal the event loss
+        {
+            let mut data = debouncer.data.inner.lock().unwrap();
+            data.add_event(Event::new(EventKind::Other).set_flag(Flag::Rescan));
+        }
+        debouncer.data.changed.notify_all();
+
+        // wait for the recovery scan to start, then create another file
+        // mid-scan and inject its event (it must be buffered and replayed)
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5))?, 2);
+        fs::write(root.join("d.txt"), b"d")?;
+        {
+            let mut data = debouncer.data.inner.lock().unwrap();
+            data.add_event(
+                Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("d.txt")),
+            );
+        }
+        debouncer.data.changed.notify_all();
+        continue_tx.send(())?;
+
+        // collect events: the resync batch must recover the lost delete and
+        // create, and the mid-scan file must be replayed afterwards
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut remove_a, mut create_c, mut create_d) = (false, false, false);
+        while !(remove_a && create_c && create_d) && Instant::now() < deadline {
+            let events = rx
+                .recv_timeout(deadline - Instant::now())
+                .expect("did not receive expected events")
+                .expect("received an error");
+
+            for event in events {
+                println!("event: {event:?}");
+                let resync = event.info() == Some(resync::RESYNC_INFO);
+                if resync
+                    && matches!(event.kind, EventKind::Remove(_))
+                    && event.paths.contains(&root.join("a.txt"))
+                {
+                    remove_a = true;
+                }
+                if resync
+                    && matches!(event.kind, EventKind::Create(_))
+                    && event.paths.contains(&root.join("c.txt"))
+                {
+                    create_c = true;
+                }
+                if matches!(event.kind, EventKind::Create(_))
+                    && event.paths.contains(&root.join("d.txt"))
+                {
+                    create_d = true;
+                }
+            }
+        }
+        assert!(remove_a, "resync batch must recover the lost delete");
+        assert!(create_c, "resync batch must recover the lost create");
+        assert!(create_d, "mid-scan create must be replayed");
+
+        // the final confirmed snapshot must contain the mid-scan file and
+        // must not contain the deleted file
+        let data = debouncer.data.inner.lock().unwrap();
+        let confirmed = data
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.last_confirmed.as_ref())
+            .expect("confirmed snapshot");
+        assert!(!confirmed.contains_path(&root.join("a.txt")));
+        assert!(confirmed.contains_path(&root.join("b.txt")));
+        assert!(confirmed.contains_path(&root.join("c.txt")));
+        assert!(confirmed.contains_path(&root.join("d.txt")));
+
+        Ok(())
     }
 
     /// Regression test: on macOS, FSEvents reports file deletions as a burst
