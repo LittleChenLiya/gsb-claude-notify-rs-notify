@@ -261,6 +261,7 @@ pub mod windows;
 
 pub mod null;
 pub mod poll;
+pub mod recording;
 
 mod config;
 mod error;
