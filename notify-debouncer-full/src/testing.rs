@@ -271,6 +271,7 @@ impl schema::State {
             cache,
             rename_event,
             rescan_event,
+            resync: None,
             errors: Vec::new(),
             timeout: Duration::from_millis(self.timeout.unwrap_or(50)),
         }

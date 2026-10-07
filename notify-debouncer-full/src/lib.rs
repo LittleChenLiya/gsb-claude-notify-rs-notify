@@ -7,6 +7,7 @@
 //! * Emits only one `Remove` event when deleting a directory (inotify)
 //! * Doesn't emit duplicate create events
 //! * Doesn't emit `Modify` events after a `Create` event
+//! * Optionally recovers from event loss with an injected directory scanner that reconciles snapshots and emits a resync batch (see [`resync`])
 //!
 //! # Installation
 //!
@@ -64,6 +65,7 @@
 //! As all file events are sourced from notify, the [known problems](https://docs.rs/notify/latest/notify/#known-problems) section applies here too.
 
 mod cache;
+pub mod resync;
 mod time;
 
 #[cfg(test)]
@@ -87,6 +89,10 @@ use rustc_hash::FxHashMap as HashMap;
 use time::now;
 
 pub use cache::{FileIdCache, NoCache, RecommendedCache};
+pub use resync::{
+    DEFAULT_MAX_BUFFERED_EVENTS, DirScanner, Fingerprint, FingerprintScanner, ResyncCoordinator,
+    ResyncOutcome, Snapshot,
+};
 
 #[cfg(not(target_family = "wasm"))]
 pub use file_id_map::FileIdMap;
@@ -220,6 +226,7 @@ pub(crate) struct DebounceDataInner<T> {
     cache: T,
     rename_event: Option<(DebouncedEvent, Option<FileId>)>,
     rescan_event: Option<DebouncedEvent>,
+    resync: Option<ResyncCoordinator>,
     errors: Vec<Error>,
     timeout: Duration,
 }
@@ -232,6 +239,7 @@ impl<T: FileIdCache> DebounceDataInner<T> {
             cache,
             rename_event: None,
             rescan_event: None,
+            resync: None,
             errors: Vec::new(),
             timeout,
         }
@@ -239,6 +247,15 @@ impl<T: FileIdCache> DebounceDataInner<T> {
 
     /// Retrieve a vec of debounced events, removing them if not continuous
     pub fn debounced_events(&mut self) -> Vec<DebouncedEvent> {
+        // While a resync scan is in flight, normal batch publishing is paused.
+        if self
+            .resync
+            .as_ref()
+            .is_some_and(ResyncCoordinator::is_scanning)
+        {
+            return Vec::new();
+        }
+
         let now = now();
         let mut events_expired = Vec::with_capacity(self.queues.len());
 
@@ -294,6 +311,72 @@ impl<T: FileIdCache> DebounceDataInner<T> {
         self.errors.push(error);
     }
 
+    /// Whether a resync scan is waiting to be picked up by the debouncer thread.
+    fn resync_scan_pending(&self) -> bool {
+        self.resync
+            .as_ref()
+            .is_some_and(ResyncCoordinator::scan_job_pending)
+    }
+
+    /// Take the pending resync scan job, if any.
+    #[allow(clippy::type_complexity)]
+    fn take_resync_scan_job(
+        &mut self,
+    ) -> Option<(u64, resync::SharedScanner, Vec<(PathBuf, RecursiveMode)>)> {
+        if !self.resync_scan_pending() {
+            return None;
+        }
+        let roots = self.roots.iter().cloned().collect::<Vec<_>>();
+        self.resync
+            .as_mut()
+            .and_then(|resync| resync.take_scan_job(roots))
+    }
+
+    /// Complete a resync scan, returning the resync batch to emit.
+    ///
+    /// Events buffered while the scan was in flight are replayed through the
+    /// normal debounce pipeline.
+    fn finish_resync_scan(
+        &mut self,
+        generation: u64,
+        result: Result<resync::Snapshot, Error>,
+    ) -> Vec<DebouncedEvent> {
+        let Some(resync) = self.resync.as_mut() else {
+            return Vec::new();
+        };
+        let outcome = resync.complete_scan(generation, result);
+
+        if let Some(error) = outcome.error {
+            self.add_error(error);
+        }
+
+        let batch = outcome.batch;
+        for event in outcome.replay {
+            self.add_event(event);
+        }
+
+        batch
+    }
+
+    /// Extend the resync baseline snapshot with a newly watched root.
+    fn resync_merge_baseline(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+        let Some(resync) = self.resync.as_mut() else {
+            return;
+        };
+        let roots = [(path.to_path_buf(), recursive_mode)];
+        match resync.scan(&roots) {
+            Ok(snapshot) => resync.merge_baseline(snapshot),
+            Err(error) => self.errors.push(error),
+        }
+    }
+
+    /// Drop a removed root from the resync baseline snapshot.
+    fn resync_remove_baseline(&mut self, path: &Path) {
+        if let Some(resync) = self.resync.as_mut() {
+            resync.remove_baseline(path);
+        }
+    }
+
     /// Add new event to debouncer cache
     pub fn add_event(&mut self, event: Event) {
         log::trace!("raw event: {event:?}");
@@ -301,8 +384,26 @@ impl<T: FileIdCache> DebounceDataInner<T> {
         if event.need_rescan() {
             let roots = self.roots.make_contiguous();
             self.cache.rescan(roots);
-            self.rescan_event = Some(DebouncedEvent { event, time: now() });
+
+            if let Some(resync) = &mut self.resync {
+                // The overflow recovery coordinator takes over: normal batch
+                // publishing is paused and a new scan generation is started.
+                resync.begin_overflow();
+            } else {
+                self.rescan_event = Some(DebouncedEvent { event, time: now() });
+            }
             return;
+        }
+
+        if let Some(resync) = &mut self.resync {
+            if resync.is_scanning() {
+                // Buffer events while a resync scan is in flight; they are
+                // replayed and re-checked once the scan completes.
+                if let Err(error) = resync.buffer_event(event) {
+                    self.errors.push(error);
+                }
+                return;
+            }
         }
 
         let path = match event.paths.first() {
@@ -612,6 +713,7 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         }
 
         data.cache.add_path(&path, recursive_mode);
+        data.resync_merge_baseline(&path, recursive_mode);
     }
 
     fn remove_root(&mut self, path: impl AsRef<Path>) {
@@ -620,6 +722,7 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         data.roots.retain(|(root, _)| !root.starts_with(&path));
 
         data.cache.remove_path(path.as_ref());
+        data.resync_remove_baseline(path.as_ref());
     }
 
     pub fn watch(
@@ -716,6 +819,39 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         self.watcher.configure(option)
     }
 
+    /// Enable overflow recovery with the given coordinator.
+    ///
+    /// Once a coordinator is set, event loss signals ([`Event::need_rescan`])
+    /// pause normal batch publishing and trigger a resync scan instead of
+    /// emitting a rescan notice. See [`resync`] for details.
+    ///
+    /// The coordinator takes an initial baseline snapshot of all currently
+    /// watched roots; roots watched later are added to the baseline as they
+    /// are registered.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use notify_debouncer_full::{new_debouncer, FingerprintScanner, ResyncCoordinator};
+    /// let mut debouncer = new_debouncer(Duration::from_secs(2), None, |_| {}).unwrap();
+    /// debouncer.set_resync_coordinator(ResyncCoordinator::new(FingerprintScanner::new()));
+    /// ```
+    pub fn set_resync_coordinator(&mut self, coordinator: ResyncCoordinator) {
+        let mut data = self.data.inner.lock().unwrap();
+
+        let roots = data.roots.iter().cloned().collect::<Vec<_>>();
+        let mut coordinator = coordinator;
+        if !roots.is_empty() {
+            match coordinator.scan(&roots) {
+                Ok(snapshot) => coordinator.merge_baseline(snapshot),
+                Err(error) => data.errors.push(error),
+            }
+        }
+
+        data.resync = Some(coordinator);
+    }
+
     #[must_use]
     pub fn kind() -> WatcherKind
     where
@@ -776,6 +912,7 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
                 while lock.queues.is_empty()
                     && lock.errors.is_empty()
                     && lock.rescan_event.is_none()
+                    && !lock.resync_scan_pending()
                     && !stop_c.load(Ordering::Acquire)
                 {
                     lock = data_c.changed.wait(lock).unwrap();
@@ -783,7 +920,28 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
                 if stop_c.load(Ordering::Acquire) {
                     break;
                 }
+
+                // Run a pending resync scan without holding the lock, so
+                // incoming events can be buffered while the scan is in flight.
+                let scan_job = lock.take_resync_scan_job();
                 drop(lock);
+                if let Some((generation, scanner, roots)) = scan_job {
+                    let result = scanner.lock().unwrap().scan(&roots);
+
+                    let mut lock = data_c.inner.lock().unwrap();
+                    let batch = lock.finish_resync_scan(generation, result);
+                    let errors = lock.errors();
+                    drop(lock);
+
+                    if !batch.is_empty() {
+                        event_handler.handle_event(Ok(batch));
+                    }
+                    if !errors.is_empty() {
+                        event_handler.handle_event(Err(errors));
+                    }
+                    continue;
+                }
+
                 std::thread::sleep(tick);
                 if stop_c.load(Ordering::Acquire) {
                     break;
@@ -1135,6 +1293,7 @@ mod tests {
             cache: NoCache,
             rename_event: None,
             rescan_event: None,
+            resync: None,
             errors: Vec::new(),
             timeout: Duration::from_millis(50),
         };

@@ -3,6 +3,7 @@
 ## unreleased
 
 - PERF: park the debouncer thread to avoid idle polling [#933]
+- FEATURE: add an optional overflow recovery coordinator (`ResyncCoordinator`) that pauses normal batch publishing on event loss, reconciles a scanned snapshot against the last confirmed one and emits a resync batch of per-path additions, removals and content fingerprint changes
 
 [#933]: https://github.com/notify-rs/notify/pull/933
 
